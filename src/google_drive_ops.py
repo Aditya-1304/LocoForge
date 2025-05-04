@@ -25,7 +25,7 @@ from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 import mimetypes
 import logging
-from olf.llm_router import process_message
+from llm_router import process_message
 from functools import partial
 
 logger = logging.getLogger(__name__)
@@ -504,41 +504,68 @@ class DriveConnector:
         Returns:
             JSON string with the operation status
         """
+        if not file_id:
+            return json.dumps({"error": "No file ID provided"})
+            
         try:
-            # First check if the file exists
+            # Check if file exists first
             try:
-                await self._run_in_thread(
+                file_info = await self._run_in_thread(
                     self.service.files().get(
                         fileId=file_id,
-                        fields="id"
+                        fields="id,name,trashed"
                     ).execute
                 )
+                
+                # If file is already in trash and we're trying to trash it again
+                if not permanent and file_info.get('trashed', False):
+                    return json.dumps({
+                        "status": "warning", 
+                        "message": f"File '{file_info.get('name', 'unknown')}' is already in trash"
+                    })
+                    
             except Exception as e:
-                if "File not found" in str(e):
-                    return json.dumps({"error": "The file or folder you're trying to delete was not found. It may have been already deleted or moved."})
-                raise
+                error_message = str(e)
+                if "File not found" in error_message or "not found" in error_message or "404" in error_message:
+                    return json.dumps({
+                        "error": f"File with ID '{file_id}' not found. It may have been deleted or you don't have access."
+                    })
+                logger.error(f"Error checking file existence: {error_message}")
+                return json.dumps({"error": f"Error accessing file: {error_message}"})
 
-            if permanent:
-                await self._run_in_thread(
-                    self.service.files().delete(
-                        fileId=file_id
-                    ).execute
-                )
-                response = {"status": "success", "message": "File permanently deleted"}
-            else:
-                # Move to trash (this is Google Drive's default behavior)
-                await self._run_in_thread(
-                    self.service.files().update(
-                        fileId=file_id,
-                        body={"trashed": True}
-                    ).execute
-                )
-                response = {"status": "success", "message": "File moved to trash"}
-            
-            return json.dumps(response)
+            # Now perform the actual delete operation
+            try:
+                if permanent:
+                    await self._run_in_thread(
+                        self.service.files().delete(fileId=file_id).execute
+                    )
+                    response = {"status": "success", "message": f"File '{file_info.get('name', file_id)}' permanently deleted"}
+                else:
+                    # Move to trash
+                    await self._run_in_thread(
+                        self.service.files().update(
+                            fileId=file_id,
+                            body={"trashed": True}
+                        ).execute
+                    )
+                    response = {"status": "success", "message": f"File '{file_info.get('name', file_id)}' moved to trash"}
+                
+                return json.dumps(response)
+                
+            except Exception as e:
+                error_message = str(e)
+                logger.error(f"Error deleting file {file_id}: {error_message}", exc_info=True)
+                
+                if "insufficient permissions" in error_message.lower() or "permission" in error_message.lower():
+                    return json.dumps({"error": "You don't have permission to delete this file"})
+                elif "rate limit" in error_message.lower() or "quota" in error_message.lower():
+                    return json.dumps({"error": "API rate limit exceeded. Please try again later."})
+                else:
+                    return json.dumps({"error": f"Delete operation failed: {error_message}"})
+                    
         except Exception as e:
-            logger.error(f"Error deleting file {file_id}: {str(e)}", exc_info=True)
-            return json.dumps({"error": str(e)})
+            logger.error(f"Unexpected error deleting file {file_id}: {str(e)}", exc_info=True)
+            return json.dumps({"error": f"Unexpected error: {str(e)}"})
     
     async def search_files(self, query_text: str, page_size: int = 100) -> str:
         """
@@ -1036,29 +1063,33 @@ async def main():
     )
     
     try:
-        # # Test 1: List files
-        # print("\nTest 1: Listing files")
-        # result = await agent.execute_command("list files")
-        # print(f"List files result: {result[:200]}...")  # Print first 200 chars
+        # Test 1: List files
+        print("\nTest 1: Listing files")
+        result = await agent.execute_command("list files")
+        print(f"List files result: {result[:200]}...")  # Print first 200 chars
         
-        # # Test 2: Create a test folder
-        # print("\nTest 2: Creating test folder")
-        # result = await agent.execute_command("create folder named: TestFolder")
-        # folder_data = json.loads(result)
-        # test_folder_id = folder_data.get('id')
-        # print(f"Created folder: {result}")
+        # Test 2: Create a test folder
+        print("\nTest 2: Creating test folder")
+        result = await agent.execute_command("create folder named: TestFolder")
+        folder_data = json.loads(result)
+        test_folder_id = folder_data.get('id')
+        print(f"Created folder: {result}")
         
-        # # Test 3: Upload a test file (if exists)
-        # test_file = "test.txt"
-        # if os.path.exists(test_file):
-        #     print(f"\nTest 3: Uploading {test_file}")
-        #     result = await agent.execute_command(f"upload file from: {test_file}")
-        #     print(f"Upload result: {result}")
+        # Test 3: Upload a test file (if exists)
+        # First create a test file
+        with open("test.txt", "w") as f:
+            f.write("This is a test file for Google Drive API testing")
         
-        # # Test 4: Search files
-        # print("\nTest 4: Searching files")
-        # result = await agent.execute_command("search for: test.txt")
-        # print(f"Search result: {result[:200]}...")
+        print("\nTest 3: Uploading test.txt")
+        result = await agent.execute_command(f"upload file from: test.txt")
+        print(f"Upload result: {result}")
+        file_data = json.loads(result)
+        test_file_id = file_data.get('id')
+        
+        # Test 4: Search files
+        print("\nTest 4: Searching files")
+        result = await agent.execute_command("search for: test.txt")
+        print(f"Search result: {result[:200]}...")
         
         # Test 5: Semantic search
         print("\nTest 5: Semantic search")
@@ -1070,27 +1101,39 @@ async def main():
         result = await agent.execute_command("find documents about testing")
         print(f"Semantic search result: {result[:200]}...")
         
-        # # Test 6: Parallel operations
-        # print("\nTest 6: Parallel operations")
-        # commands = [
-        #     "list files",
-        #     "search for: test",
-        #     "create folder named: ParallelTest"
-        # ]
-        # results = await agent.execute_commands(commands)
-        # for cmd, result in zip(commands, results):
-        #     print(f"\nCommand: {cmd}")
-        #     print(f"Result: {result[:200]}...")
+        # Test 6: Parallel operations
+        print("\nTest 6: Parallel operations")
+        commands = [
+            "list files",
+            "search for: test",
+            "create folder named: ParallelTest"
+        ]
+        results = await agent.execute_commands(commands)
+        for cmd, result in zip(commands, results):
+            print(f"\nCommand: {cmd}")
+            print(f"Result: {result[:200]}...")
         
-        # # Cleanup: Delete test folders
-        # if test_folder_id:
-        #     print("\nCleaning up test folders...")
-        #     result = await agent.execute_command(f"delete file id: {test_folder_id}")
-        #     print(f"Cleanup result: {result}")
+        # Test 7: Specifically test file deletion (move to trash)
+        if test_file_id:
+            print("\nTest 7a: Moving file to trash")
+            result = await agent.execute_command(f"delete file id: {test_file_id}")
+            print(f"Delete result: {result}")
+            
+            # Try to delete again to test "already in trash" case
+            print("\nTest 7b: Trying to delete already-trashed file")
+            result = await agent.execute_command(f"delete file id: {test_file_id}")
+            print(f"Delete again result: {result}")
+        
+        # Test 8: Test permanent deletion of test folder
+        if test_folder_id:
+            print("\nTest 8: Permanently deleting test folder")
+            result = await agent.drive.delete_file(test_folder_id, permanent=True)
+            print(f"Permanent delete result: {result}")
             
     except Exception as e:
         print(f"\nError during tests: {str(e)}")
-        raise
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     # Run the async main function
